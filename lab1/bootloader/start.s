@@ -32,7 +32,7 @@ message:
 */
 
 # TODO: This is lab1.2
-/* Protected Mode Hello World */
+/* Protected Mode Hello World 
 
 .code16
 
@@ -126,12 +126,12 @@ gdtDesc:
     .long gdt 
 
 
-
+*/
 
 
 # TODO: This is lab1.3
 
-/* Protected Mode Loading Hello World APP 
+/* Protected Mode Loading Hello World APP */
 .code16
 
 .global start
@@ -140,8 +140,8 @@ start:
 	movw %ax, %ds
 	movw %ax, %es
 	movw %ax, %ss
-	# TODO:关闭中断
-
+	# 关闭中断
+    cli     
 
 	# 启动A20总线
 	inb $0x92, %al 
@@ -151,7 +151,11 @@ start:
 	# 加载GDTR
 	data32 addr32 lgdt gdtDesc # loading gdtr, data32, addr32
 
+
 	# TODO：设置CR0的PE位（第0位）为1
+    movl %cr0, %eax
+    orl $0x1, %eax
+    movl %eax, %cr0
 
 
 	# 长跳转切换至保护模式
@@ -179,19 +183,19 @@ gdt: # 8 bytes for each table entry, at least 1 entry
 	.word 0,0
 	.byte 0,0,0,0
 
-	# TODO：code segment entry
-	.word
-	.byte 
+    # code segment entry
+	.word 0xffff,0  #段限制：15：0
+	.byte 0,0x9a,0xcf,0 # 基地址0；读/执行且DPL=0；G=1(4KB粒度), D/B=1(32比特默认操作大小), L=0, AVL=0, 段限制19:16 = 1111
 
-	# TODO：data segment entry
-	.word
-	.byte 
+    # data segment entry
+	.word 0xffff,0 
+	.byte 0,0x92,0xcf,0 #读/写
 
-	# TODO：graphics segment entry
-	.word
-	.byte 
+    # graphics segment entry
+	.word 0xffff,0x8000 
+	.byte 0x0b,0xfa,0xcf,0 # 读写/可执行
 
 gdtDesc: 
 	.word (gdtDesc - gdt - 1) 
 	.long gdt 
-*/
+

@@ -1,11 +1,20 @@
 #include "boot.h"
 
 #define SECTSIZE 512
+#define APP_SECTOR 1
 
 void bootMain(void) {
-	//TODO
-
+    /* 加载应用程序至内存 */
+    char *buffer = (char*)0x8c00;
+    int offset = APP_SECTOR;  // 用户程序在磁盘上的扇区偏移
+    readSect(buffer, offset);
+  
+    /* 跳转至应用程序入口 */
+    void (*entry)(void); // 定义函数指针
+    entry = (void(*)(void))buffer; // 强制类型转换
+    entry();
 }
+
 
 
 void waitDisk(void) { // waiting for disk

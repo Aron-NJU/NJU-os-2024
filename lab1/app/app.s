@@ -14,7 +14,7 @@ message:
 displayStr:
 	movl 4(%esp), %ebx
 	movl 8(%esp), %ecx
-	movl $((80*5+0)*2), %edi
+	movl $((80*6+0)*2), %edi
 	movb $0x0c, %ah
 nextChar:
 	movb (%ebx), %al
