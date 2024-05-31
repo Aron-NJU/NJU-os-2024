@@ -8,6 +8,7 @@
 #define SYS_SLEEP 4
 #define SYS_EXIT 5
 #define SYS_SEM 6
+#define SYS_PID 7
 
 #define STD_OUT 0
 #define STD_IN 1
@@ -44,6 +45,7 @@ void syscallExec(struct StackFrame *sf);
 void syscallSleep(struct StackFrame *sf);
 void syscallExit(struct StackFrame *sf);
 void syscallSem(struct StackFrame *sf);
+void syscallPid(struct StackFrame *sf);
 
 void syscallWriteStdOut(struct StackFrame *sf);
 
@@ -53,6 +55,10 @@ void syscallSemInit(struct StackFrame *sf);
 void syscallSemWait(struct StackFrame *sf);
 void syscallSemPost(struct StackFrame *sf);
 void syscallSemDestroy(struct StackFrame *sf);
+void triggerScheduler() {
+    // 使用内联汇编触发调度中断
+    asm volatile("int $0x20");
+}
 
 void irqHandle(struct StackFrame *sf) { // pointer sf = esp
 	/* Reassign segment register */
@@ -151,6 +157,20 @@ void keyboardHandle(struct StackFrame *sf) {
 
 	if (dev[STD_IN].value < 0) { // with process blocked
 		// TODO: deal with blocked situation
+ 		// 增加设备值，表示有一个进程被唤醒
+        dev[STD_IN].value++;
+
+        // 获取阻塞在标准输入设备上的进程表指针
+        pt = (ProcessTable *)((uint32_t)(dev[STD_IN].pcb.prev) - (uint32_t)&(((ProcessTable *)0)->blocked));
+        
+        // 将该进程的状态设置为可运行
+        pt->state = STATE_RUNNABLE;
+        pt->sleepTime = 0;
+
+        // 从设备队列中移除该进程-最后一个节点
+		// 维护双向链表
+		dev[STD_IN].pcb.prev = (dev[STD_IN].pcb.prev)->prev;
+		(dev[STD_IN].pcb.prev)->next = &(dev[STD_IN].pcb);
 	}
 
 	return;
@@ -179,6 +199,8 @@ void syscallHandle(struct StackFrame *sf) {
 		case SYS_SEM:
 			syscallSem(sf);
 			break; // for SYS_SEM
+		case SYS_PID:
+			syscallPid(sf);
 		default:break;
 	}
 }
@@ -247,6 +269,54 @@ void syscallRead(struct StackFrame *sf) {
 
 void syscallReadStdIn(struct StackFrame *sf) {
 	// TODO: complete `stdin`
+	if (dev[STD_IN].value < 0) {
+        pcb[current].regs.eax = -1;
+    } 
+    // 如果标准输入设备的值为 0，表示当前没有数据，需要阻塞当前进程
+    else if (dev[STD_IN].value == 0) {
+        dev[STD_IN].value--;  // 减少标准输入设备的值
+
+        // 将当前进程加入到标准输入设备的阻塞队列中
+        pcb[current].blocked.next = dev[STD_IN].pcb.next;
+        pcb[current].blocked.prev = &(dev[STD_IN].pcb);
+        dev[STD_IN].pcb.next = &(pcb[current].blocked);
+        (pcb[current].blocked.next)->prev = &(pcb[current].blocked);
+
+        // 将当前进程状态设置为阻塞，并设置睡眠时间为 -1（表示无限期睡眠）
+        pcb[current].state = STATE_BLOCKED;
+        pcb[current].sleepTime = -1;
+
+        // 触发调度程序进行进程切换
+        asm volatile("int $0x20");
+
+        // 执行进程切换后的操作
+        int sel = sf->ds;  // 获取数据段选择子
+        char *str = (char*)sf->edx;  // 获取目标字符串指针
+        int size = sf->ebx;  // 获取要读取的字节数
+        char c = 0;  // 用于存储读取的字符
+
+        // 设置 ES 段寄存器
+        asm volatile("movw %0, %%es"::"m"(sel));
+        
+        // 从键盘缓冲区读取字符
+        int i;
+        for (i = 0; i < size - 1; i++) {
+            if (bufferHead == bufferTail) break;  // 如果缓冲区为空，退出循环
+            c = getChar(keyBuffer[bufferHead]);  // 获取字符
+            bufferHead = (bufferHead + 1) % MAX_KEYBUFFER_SIZE;  // 更新缓冲区头指针
+            putChar(c);  // 将字符输出到屏幕
+            if (c != 0) {
+                // 将字符存储到目标字符串中
+                asm volatile("movb %0, %%es:(%1)"::"r"(c), "r"(str + i));
+            } else {
+                i--;  // 如果字符为 0，调整索引以覆盖该位置
+            }
+        }
+
+        // 在目标字符串末尾添加终止符
+        asm volatile("movb $0x00, %%es:(%0)"::"r"(str + i));
+        pcb[current].regs.eax = i;  // 设置返回值为读取的字节数
+    }
 }
 
 void syscallFork(struct StackFrame *sf) {
@@ -345,26 +415,136 @@ void syscallSem(struct StackFrame *sf) {
 	}
 }
 
+// 查找未使用的信号量
+int findUnusedSemaphore() {
+    for (int i = 0; i < MAX_SEM_NUM; i++) {
+        if (sem[i].state == 0) {
+            return i;  // 返回未使用的信号量索引
+        }
+    }
+    return -1;  // 如果没有找到未使用的信号量，返回 -1
+}
+// 初始化信号量
+void initSemaphore(int semIndex, int32_t initialValue) {
+    sem[semIndex].state = 1;  // 设置信号量状态为使用中
+    sem[semIndex].value = initialValue;  // 设置信号量的初始值
+    sem[semIndex].pcb.next = &(sem[semIndex].pcb);  // 初始化信号量的队列指针
+    sem[semIndex].pcb.prev = &(sem[semIndex].pcb);
+}
 void syscallSemInit(struct StackFrame *sf) {
 	// TODO: complete `SemInit`
-	return;
+    int semIndex = findUnusedSemaphore();  // 查找未使用的信号量索引
+
+    pcb[current].regs.eax = semIndex;  // 设置返回值为找到的信号量索引
+
+    // 如果找到未使用的信号量，进行初始化
+    if (semIndex != -1) {
+        initSemaphore(semIndex, (int32_t)sf->edx);  // 初始化信号量
+    }
+
+    return;
 }
+
+
+// 检查信号量是否有效
+_Bool isValidSemaphore(int semIndex) {
+    return sem[semIndex].state != 0;
+}
+
+// 阻塞当前进程
+void blockCurrentProcess(int semIndex) {
+    // 将当前进程加入到信号量的阻塞队列中
+    pcb[current].blocked.next = sem[semIndex].pcb.next;
+    pcb[current].blocked.prev = &(sem[semIndex].pcb);
+    sem[semIndex].pcb.next = &(pcb[current].blocked);
+    (pcb[current].blocked.next)->prev = &(pcb[current].blocked);
+
+    // 将当前进程状态设置为阻塞，并设置睡眠时间为 -1（表示无限期睡眠）
+    pcb[current].state = STATE_BLOCKED;
+    pcb[current].sleepTime = -1;
+
+    // 触发调度程序进行进程切换
+    triggerScheduler();
+}
+
+// 等待信号量
+void waitOnSemaphore(int semIndex) {
+    pcb[current].regs.eax = 0;  // 设置返回值为 0，表示成功
+    sem[semIndex].value--;  // 减少信号量的值
+
+    // 如果信号量值小于 0，表示有进程需要被阻塞
+    if (sem[semIndex].value < 0) {
+        blockCurrentProcess(semIndex);  // 阻塞当前进程
+    }
+}
+
 
 void syscallSemWait(struct StackFrame *sf) {
 	// TODO: complete `SemWait` and note that you need to consider some special situations
+    int semIndex = (int)sf->edx;  // 获取信号量索引
+
+    if (isValidSemaphore(semIndex)) {
+        waitOnSemaphore(semIndex);  // 等待信号量
+    } else {
+        pcb[current].regs.eax = -1;  // 设置返回值为 -1，表示信号量未使用
+    }
 }
 
+
+// 从信号量队列中移除一个阻塞的进程
+void removeFromSemaphoreQueue(int semIndex) {
+    sem[semIndex].pcb.prev = (sem[semIndex].pcb.prev)->prev;
+    (sem[semIndex].pcb.prev)->next = &(sem[semIndex].pcb);
+}
+// 获取阻塞在信号量上的进程表指针
+ProcessTable* getNextBlockedProcess(int semIndex) {
+    return (ProcessTable*)((uint32_t)(sem[semIndex].pcb.prev) - (uint32_t)&(((ProcessTable*)0)->blocked));
+}
 void syscallSemPost(struct StackFrame *sf) {
-	int i = (int)sf->edx;
-	ProcessTable *pt = NULL;
-	if (i < 0 || i >= MAX_SEM_NUM) {
-		pcb[current].regs.eax = -1;
-		return;
-	}
-	// TODO: complete other situations
-}
+    int semIndex = (int)sf->edx;
+    ProcessTable *pt = NULL;
+    // 检查信号量索引是否在合法范围内
+    if (semIndex < 0 || semIndex >= MAX_SEM_NUM) {
+        pcb[current].regs.eax = -1;  // 设置返回值为-1，表示错误
+        return;
+    }
 
+	// TODO
+    // 检查信号量是否有效
+    if (sem[semIndex].state == 0) {
+        pcb[current].regs.eax = -1;  // 设置返回值为-1，表示信号量未使用
+    } else {
+        pcb[current].regs.eax = 0;  // 设置返回值为0，表示成功
+        sem[semIndex].value++;  // 增加信号量的值
+        // 如果有进程阻塞在信号量上，唤醒一个阻塞进程
+        if (sem[semIndex].value <= 0) {
+            pt = getNextBlockedProcess(semIndex);  // 获取阻塞的进程表指针
+            removeFromSemaphoreQueue(semIndex);  // 从信号量队列中移除该进程
+            pt->state = STATE_RUNNABLE;  // 将进程状态设置为可运行
+            pt->sleepTime = 0;  // 重置睡眠时间
+        }
+    }
+}
 void syscallSemDestroy(struct StackFrame *sf) {
 	// TODO: complete `SemDestroy`
-	return;
+	// 获取信号量的索引
+    int semIndex = (int)sf->edx;
+    // 检查信号量是否有效
+    if (sem[semIndex].state == 0) {
+        // 如果信号量未被使用，返回错误码 -1
+        pcb[current].regs.eax = -1;
+    } 
+	else {
+        // 如果信号量有效，设置返回值为 0
+        pcb[current].regs.eax = 0;
+        // 销毁信号量，将其状态设置为未使用
+        sem[semIndex].state = 0;
+        // 触发调度程序进行进程切换
+        triggerScheduler();
+    }
+    return;
+}
+void syscallPid(struct StackFrame *sf){
+	pcb[current].regs.eax = current;
+	return ;
 }
